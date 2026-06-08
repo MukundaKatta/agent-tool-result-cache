@@ -111,8 +111,10 @@ class ToolResultCache:
     ) -> None:
         """Cache `result` for `(tool_name, args)`. If the effective TTL is 0,
         this is a no-op (the tool is opted out of caching)."""
-        ttl = ttl_seconds if ttl_seconds is not None else self._ttls.get(
-            tool_name, self._default_ttl
+        ttl = (
+            ttl_seconds
+            if ttl_seconds is not None
+            else self._ttls.get(tool_name, self._default_ttl)
         )
         if ttl <= 0:
             return  # never cache
@@ -143,9 +145,7 @@ class ToolResultCache:
         found, value = self._lookup(tool_name, args)
         return value if found else None
 
-    def _lookup(
-        self, tool_name: str, args: dict[str, Any]
-    ) -> tuple[bool, Any]:
+    def _lookup(self, tool_name: str, args: dict[str, Any]) -> tuple[bool, Any]:
         """Internal: returns (found, value). Bumps stats."""
         key = _hash_args(tool_name, args)
         now = time.monotonic()

@@ -1,8 +1,10 @@
 """
 agent-tool-result-cache: LRU+TTL cache for agent tool call results.
 """
+
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import time
@@ -10,9 +12,14 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+# Sentinel distinguishing "no cached value" from a cached value that is None.
+_MISS = object()
+
 
 def _hash_call(tool_name: str, args: dict[str, Any]) -> str:
-    raw = json.dumps({"tool": tool_name, "args": args}, sort_keys=True, ensure_ascii=False)
+    raw = json.dumps(
+        {"tool": tool_name, "args": args}, sort_keys=True, ensure_ascii=False
+    )
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
@@ -20,6 +27,7 @@ def _hash_call(tool_name: str, args: dict[str, Any]) -> str:
 class CacheEntry:
     key: str
     result: Any
+    tool_name: str = ""
     created_at: float = field(default_factory=time.monotonic)
     ttl: Optional[float] = None
     hit_count: int = 0
@@ -58,31 +66,50 @@ class ToolResultCache:
         self._misses = 0
 
     def _evict_if_needed(self) -> None:
-        while len(self._store) >= self._max_size:
+        while len(self._store) > self._max_size:
             self._store.popitem(last=False)
 
-    def put(self, tool_name: str, args: dict[str, Any], result: Any, ttl: Optional[float] = None) -> str:
+    def put(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        result: Any,
+        ttl: Optional[float] = None,
+    ) -> str:
         key = _hash_call(tool_name, args)
-        self._evict_if_needed()
-        entry = CacheEntry(key=key, result=result, ttl=ttl if ttl is not None else self._default_ttl)
+        entry = CacheEntry(
+            key=key,
+            result=result,
+            tool_name=tool_name,
+            ttl=ttl if ttl is not None else self._default_ttl,
+        )
+        # Insert/overwrite first, then evict. Evicting beforehand could drop a
+        # live entry when we are only updating an existing key (no size growth).
         self._store[key] = entry
         self._store.move_to_end(key)
+        self._evict_if_needed()
         return key
 
-    def get(self, tool_name: str, args: dict[str, Any]) -> Optional[Any]:
+    def _get_or_sentinel(self, tool_name: str, args: dict[str, Any]) -> Any:
+        """Like :meth:`get` but returns ``_MISS`` on miss/expiry so a cached
+        ``None`` can be distinguished from a cache miss. Updates stats/LRU."""
         key = _hash_call(tool_name, args)
         entry = self._store.get(key)
         if entry is None:
             self._misses += 1
-            return None
+            return _MISS
         if entry.expired:
             del self._store[key]
             self._misses += 1
-            return None
+            return _MISS
         entry.hit_count += 1
         self._store.move_to_end(key)
         self._hits += 1
         return entry.result
+
+    def get(self, tool_name: str, args: dict[str, Any]) -> Optional[Any]:
+        result = self._get_or_sentinel(tool_name, args)
+        return None if result is _MISS else result
 
     def has(self, tool_name: str, args: dict[str, Any]) -> bool:
         key = _hash_call(tool_name, args)
@@ -102,17 +129,13 @@ class ToolResultCache:
         return False
 
     def invalidate_tool(self, tool_name: str) -> int:
-        """Remove all cached results for a given tool."""
-        prefix = hashlib.sha256(f'{{"tool": "{tool_name}"'.encode()).hexdigest()[:8]
-        # We can't easily filter by tool without re-hashing; scan entries
-        # Instead keep a secondary index: we'll use a simpler approach: re-hash
-        to_remove = []
-        for key, entry in self._store.items():
-            # Re-derive key to check tool name (store tool name in entry data)
-            pass  # Without storing tool name in entry, we can't easily filter
-        # Practical approach: store tool name in the entry key lookup
-        # Since we don't have it, return 0 (documented limitation)
-        return 0
+        """Remove all cached results for a given tool. Returns the count removed."""
+        to_remove = [
+            key for key, entry in self._store.items() if entry.tool_name == tool_name
+        ]
+        for key in to_remove:
+            del self._store[key]
+        return len(to_remove)
 
     def prune_expired(self) -> int:
         expired = [k for k, e in self._store.items() if e.expired]
@@ -159,15 +182,21 @@ class ToolResultCache:
         The function must accept keyword arguments only (or at least the ones
         that determine uniqueness).
         """
+
         def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+            @functools.wraps(fn)
             def wrapper(**kwargs: Any) -> Any:
-                cached = self.get(tool_name, kwargs)
-                if cached is not None:
+                # Use a sentinel so a cached result of ``None`` is still served
+                # from the cache instead of triggering a re-run on every call.
+                cached = self._get_or_sentinel(tool_name, kwargs)
+                if cached is not _MISS:
                     return cached
                 result = fn(**kwargs)
                 self.put(tool_name, kwargs, result, ttl=ttl)
                 return result
+
             return wrapper
+
         return decorator
 
 
